@@ -173,6 +173,88 @@ pub fn has_binary(dir: &Path) -> bool {
     dir.join("down_meta.bin").exists()
 }
 
+/// Read down_meta WITHOUT token resolution (ids + logits only) — the stage
+/// resume path reloads an interrupted run's partial checkpoint to continue it,
+/// and the final write never stores token strings, so resolving them would
+/// pay ~27M tokenizer decodes for nothing. `expected_layers` validates the
+/// header against the model when known.
+/// Returns (down_meta, total_features, top_k_count).
+#[allow(clippy::type_complexity)]
+pub fn read_binary_raw(
+    dir: &Path,
+    expected_layers: usize,
+) -> Result<(Vec<Option<Vec<Option<FeatureMeta>>>>, usize, usize), VindexError> {
+    let path = dir.join("down_meta.bin");
+    let file = std::fs::File::open(&path)?;
+    let mut r = BufReader::new(file);
+
+    let magic = read_u32(&mut r)?;
+    if magic != MAGIC {
+        return Err(VindexError::Parse(format!(
+            "invalid down_meta.bin magic: expected 0x{MAGIC:08X}, got 0x{magic:08X}"
+        )));
+    }
+    let version = read_u32(&mut r)?;
+    if version != FORMAT_VERSION {
+        return Err(VindexError::Parse(format!(
+            "unsupported down_meta.bin version: {version}"
+        )));
+    }
+    let num_layers = read_u32(&mut r)? as usize;
+    let top_k_count = read_u32(&mut r)? as usize;
+    if num_layers != expected_layers {
+        return Err(VindexError::Parse(format!(
+            "down_meta.bin holds {num_layers} layer(s), model has {expected_layers}"
+        )));
+    }
+
+    let mut down_meta: Vec<Option<Vec<Option<FeatureMeta>>>> = Vec::with_capacity(num_layers);
+    let mut total = 0usize;
+
+    for _ in 0..num_layers {
+        let num_features = read_u32(&mut r)? as usize;
+        if num_features == 0 {
+            down_meta.push(None);
+            continue;
+        }
+
+        let mut features: Vec<Option<FeatureMeta>> = Vec::with_capacity(num_features);
+        for _ in 0..num_features {
+            let top_token_id = read_u32(&mut r)?;
+            let c_score = read_f32(&mut r)?;
+
+            let mut top_k = Vec::with_capacity(top_k_count);
+            for _ in 0..top_k_count {
+                let token_id = read_u32(&mut r)?;
+                let logit = read_f32(&mut r)?;
+                if token_id > 0 || logit != 0.0 {
+                    top_k.push(larql_models::TopKEntry {
+                        token: String::new(),
+                        token_id,
+                        logit,
+                    });
+                }
+            }
+
+            if top_token_id == 0 && c_score == 0.0 && top_k.is_empty() {
+                features.push(None);
+            } else {
+                features.push(Some(FeatureMeta {
+                    top_token: String::new(),
+                    top_token_id,
+                    c_score,
+                    top_k,
+                }));
+                total += 1;
+            }
+        }
+
+        down_meta.push(Some(features));
+    }
+
+    Ok((down_meta, total, top_k_count))
+}
+
 /// Mmap down_meta.bin and build a lazy reader (zero heap for feature data).
 /// Only parses the header + per-layer feature counts to build the offset table.
 pub fn mmap_binary(

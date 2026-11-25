@@ -3018,7 +3018,7 @@ fn streaming_extract_packedbf16_consume_shards() {
     let tokenizer = load_tokenizer(&model_dir);
 
     let mut cb = larql_vindex::SilentBuildCallbacks;
-    let opts = larql_vindex::StreamingOpts { consume_shards: true };
+    let opts = larql_vindex::StreamingOpts { consume_shards: true, stage_control: Default::default() };
     larql_vindex::build_vindex_streaming_opts(
         &model_dir,
         &tokenizer,
@@ -3063,7 +3063,7 @@ fn streaming_extract_packedbf16_inference_level_consume() {
     let tokenizer = load_tokenizer(&model_dir);
 
     let mut cb = larql_vindex::SilentBuildCallbacks;
-    let opts = larql_vindex::StreamingOpts { consume_shards: true };
+    let opts = larql_vindex::StreamingOpts { consume_shards: true, stage_control: Default::default() };
     larql_vindex::build_vindex_streaming_opts(
         &model_dir,
         &tokenizer,
@@ -3108,4 +3108,256 @@ fn streaming_extract_packedbf16_inference_level_consume() {
 
     let _ = std::fs::remove_dir_all(&model_dir);
     let _ = std::fs::remove_dir_all(&output_dir);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Two-session split (M2 step-8): stage-resume manifest + threaded down stage.
+// Session A = gate+router+embed → persist + stop; session B = restore →
+// threaded down → finalize. Outputs must be byte-identical to a single
+// serial session; an interrupted down stage must resume from its per-layer
+// checkpoint byte-identically too.
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn two_session_extract(output_dir: &std::path::Path, stop_after: &str, threads: usize, tag: &str) {
+    use gemma4_fixture_support::*;
+
+    let spec = FixtureSpec::default();
+    let (model_dir_a, shards_a) = build_model(&format!("two_session_a_{tag}"), &spec);
+    let tokenizer_a = load_tokenizer(&model_dir_a);
+    let manifest_path = output_dir.join("stage-manifest.json");
+
+    // Session A.
+    let opts = larql_vindex::StreamingOpts {
+        consume_shards: true,
+        stage_control: larql_vindex::StageControl {
+            manifest_path: Some(manifest_path.clone()),
+            stop_after: Some(stop_after.to_string()),
+            down_threads: threads,
+        },
+    };
+    larql_vindex::build_vindex_streaming_opts(
+        &model_dir_a,
+        &tokenizer_a,
+        "gemma4/fixture",
+        output_dir,
+        5,
+        larql_vindex::ExtractLevel::Browse,
+        larql_vindex::StorageDtype::F32,
+        &mut larql_vindex::SilentBuildCallbacks,
+        &opts,
+    )
+    .expect("session A");
+    for shard in &shards_a {
+        assert!(!shard.exists(), "session A stop must release+delete shards");
+    }
+    assert!(model_dir_a.join("config.json").exists(), "non-shard files survive");
+    let _ = std::fs::remove_dir_all(&model_dir_a);
+}
+
+fn assert_matches_reference(output_dir: &std::path::Path, ref_dir: &std::path::Path) {
+    for f in [
+        "gate_vectors.bin",
+        "router_weights.bin",
+        "embeddings.bin",
+        "down_meta.bin",
+        "tokenizer.json",
+    ] {
+        let a = std::fs::read(output_dir.join(f)).expect(f);
+        let b = std::fs::read(ref_dir.join(f)).expect(f);
+        assert_eq!(a, b, "{f} must be byte-identical to the single-session reference");
+    }
+    let norm = |p: &std::path::Path| {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(p.join("index.json")).unwrap()).unwrap();
+        if let Some(src) = v.get_mut("source") {
+            if let Some(o) = src.as_object_mut() {
+                o.remove("extracted_at");
+            }
+        }
+        v
+    };
+    assert_eq!(norm(output_dir), norm(ref_dir), "index.json equal modulo extracted_at");
+}
+
+#[test]
+fn streaming_extract_packedbf16_two_session_split() {
+    use gemma4_fixture_support::*;
+
+    // Reference: one serial single-session run.
+    let spec = FixtureSpec::default();
+    let (ref_model, _) = build_model("two_session_ref", &spec);
+    let ref_tok = load_tokenizer(&ref_model);
+    let ref_dir = temp_dir("two_session_ref_out");
+    larql_vindex::build_vindex_streaming(
+        &ref_model,
+        &ref_tok,
+        "gemma4/fixture",
+        &ref_dir,
+        5,
+        larql_vindex::ExtractLevel::Browse,
+        larql_vindex::StorageDtype::F32,
+        &mut larql_vindex::SilentBuildCallbacks,
+    )
+    .expect("reference extraction");
+
+    // Session A → persist + stop.
+    let out_dir = temp_dir("two_session_split_out");
+    two_session_extract(&out_dir, "embeddings", 0, "split");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out_dir.join("stage-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    for stage in ["gate_vectors", "router_weights", "embeddings"] {
+        assert!(manifest["stages"][stage].is_object(), "manifest records {stage}");
+        assert!(
+            !manifest["stages"][stage]["sha256"].as_str().unwrap().is_empty(),
+            "{stage} carries a sha256"
+        );
+    }
+    assert_eq!(manifest["layer_infos"].as_array().unwrap().len(), spec.num_layers);
+    assert!(!out_dir.join("down_meta.bin").exists(), "session A writes no down_meta");
+
+    // Session B: simulated re-download (deterministic fixture) + restore —
+    // the stage products are already in out_dir, exactly like a real resume.
+    let (model_dir_b, _) = build_model("two_session_b", &spec);
+    let tokenizer_b = load_tokenizer(&model_dir_b);
+    let opts = larql_vindex::StreamingOpts {
+        consume_shards: true,
+        stage_control: larql_vindex::StageControl {
+            manifest_path: Some(out_dir.join("stage-manifest.json")),
+            stop_after: None,
+            down_threads: 4, // threaded down: must stay byte-identical
+        },
+    };
+    larql_vindex::build_vindex_streaming_opts(
+        &model_dir_b,
+        &tokenizer_b,
+        "gemma4/fixture",
+        &out_dir,
+        5,
+        larql_vindex::ExtractLevel::Browse,
+        larql_vindex::StorageDtype::F32,
+        &mut larql_vindex::SilentBuildCallbacks,
+        &opts,
+    )
+    .expect("session B");
+    assert_matches_reference(&out_dir, &ref_dir);
+
+    // Idempotent re-run: everything complete → skip all, artifact untouched.
+    // Shards must be re-provisioned first (a real session re-downloads).
+    let before = std::fs::read(out_dir.join("down_meta.bin")).unwrap();
+    let (model_dir_b, _) = build_model("two_session_b2", &spec);
+    let tokenizer_b = load_tokenizer(&model_dir_b);
+    let opts = larql_vindex::StreamingOpts {
+        consume_shards: true,
+        stage_control: larql_vindex::StageControl {
+            manifest_path: Some(out_dir.join("stage-manifest.json")),
+            stop_after: None,
+            down_threads: 0,
+        },
+    };
+    larql_vindex::build_vindex_streaming_opts(
+        &model_dir_b,
+        &tokenizer_b,
+        "gemma4/fixture",
+        &out_dir,
+        5,
+        larql_vindex::ExtractLevel::Browse,
+        larql_vindex::StorageDtype::F32,
+        &mut larql_vindex::SilentBuildCallbacks,
+        &opts,
+    )
+    .expect("idempotent re-run");
+    assert_eq!(before, std::fs::read(out_dir.join("down_meta.bin")).unwrap());
+
+    let _ = std::fs::remove_dir_all(&ref_model);
+    let _ = std::fs::remove_dir_all(&ref_dir);
+    let _ = std::fs::remove_dir_all(&model_dir_b);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
+fn streaming_extract_packedbf16_down_checkpoint_resume() {
+    use gemma4_fixture_support::*;
+
+    // Reference + its down_meta.bin layer geometry.
+    let spec = FixtureSpec::default();
+    let (ref_model, _) = build_model("ckpt_ref", &spec);
+    let ref_tok = load_tokenizer(&ref_model);
+    let ref_dir = temp_dir("ckpt_ref_out");
+    larql_vindex::build_vindex_streaming(
+        &ref_model,
+        &ref_tok,
+        "gemma4/fixture",
+        &ref_dir,
+        5,
+        larql_vindex::ExtractLevel::Browse,
+        larql_vindex::StorageDtype::F32,
+        &mut larql_vindex::SilentBuildCallbacks,
+    )
+    .expect("reference extraction");
+    let ref_meta = std::fs::read(ref_dir.join("down_meta.bin")).unwrap();
+    let magic = u32::from_le_bytes(ref_meta[0..4].try_into().unwrap());
+    let ver = u32::from_le_bytes(ref_meta[4..8].try_into().unwrap());
+    let num_layers = u32::from_le_bytes(ref_meta[8..12].try_into().unwrap()) as usize;
+    let top_k = u32::from_le_bytes(ref_meta[12..16].try_into().unwrap()) as usize;
+    assert_eq!(magic, 0x444D_4554);
+    assert_eq!(ver, 1);
+    assert_eq!(num_layers, spec.num_layers);
+
+    // Carve a genuine 1-layer checkpoint out of the reference (layer 0 real,
+    // layer 1 absent) — the state an interrupted session B would leave behind.
+    let record = 8 + top_k * 8;
+    let l0_count = u32::from_le_bytes(ref_meta[16..20].try_into().unwrap()) as usize;
+    let l0_end = 20 + l0_count * record;
+    let out_dir = temp_dir("ckpt_resume_out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let mut partial = ref_meta[..l0_end].to_vec();
+    partial.extend_from_slice(&0u32.to_le_bytes()); // layer 1 = None
+    std::fs::write(out_dir.join("down_meta.bin"), &partial).unwrap();
+
+    // Session A products + a manifest marking down_meta done through layer 0.
+    two_session_extract(&out_dir, "embeddings", 0, "ckpt");
+    let mut manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out_dir.join("stage-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    manifest["stages"]["down_meta"] = serde_json::json!({
+        "output": "down_meta.bin", "bytes": partial.len(), "sha256": "", "done_layers": 1
+    });
+    std::fs::write(
+        out_dir.join("stage-manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    // Resume: down continues from layer 1, keeps the checkpoint's layer 0.
+    let (model_dir_b, _) = build_model("ckpt_resume_b", &spec);
+    let tokenizer_b = load_tokenizer(&model_dir_b);
+    let opts = larql_vindex::StreamingOpts {
+        consume_shards: true,
+        stage_control: larql_vindex::StageControl {
+            manifest_path: Some(out_dir.join("stage-manifest.json")),
+            stop_after: None,
+            down_threads: 4,
+        },
+    };
+    larql_vindex::build_vindex_streaming_opts(
+        &model_dir_b,
+        &tokenizer_b,
+        "gemma4/fixture",
+        &out_dir,
+        5,
+        larql_vindex::ExtractLevel::Browse,
+        larql_vindex::StorageDtype::F32,
+        &mut larql_vindex::SilentBuildCallbacks,
+        &opts,
+    )
+    .expect("checkpoint resume");
+    assert_matches_reference(&out_dir, &ref_dir);
+
+    let _ = std::fs::remove_dir_all(&ref_model);
+    let _ = std::fs::remove_dir_all(&ref_dir);
+    let _ = std::fs::remove_dir_all(&model_dir_b);
+    let _ = std::fs::remove_dir_all(&out_dir);
 }

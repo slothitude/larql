@@ -10,6 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use ndarray::Array2;
 
 use crate::config::dtype::StorageDtype;
@@ -131,6 +133,120 @@ pub struct StreamingOpts {
     /// extract levels delete only after the model-weights stage, so the weight
     /// pass can never hit a closed shard.
     pub consume_shards: bool,
+    /// Two-session split control (M2 step-8). Default = classic single-session
+    /// run with unchanged behavior.
+    pub stage_control: StageControl,
+}
+
+/// Stage-control for the two-session split (M2 step-8).
+///
+/// A session runs a prefix of the extraction pipeline, persists its outputs
+/// plus a `stage-manifest.json`, and exits; the next session resumes from that
+/// manifest. `StageControl::default()` keeps the classic single-session run:
+/// no manifest, no skip, serial down stage — byte-identical to previous
+/// versions.
+#[derive(Debug, Clone, Default)]
+pub struct StageControl {
+    /// Path of the stage manifest (written on each stage completion and
+    /// consumed on load). When `Some`, stages recorded as complete are
+    /// skipped and every stage completed during this run is recorded with its
+    /// output file's sha256 + byte size.
+    pub manifest_path: Option<PathBuf>,
+    /// Stop cleanly after this stage completes (manifest updated, open shards
+    /// released under `consume_shards`, then `Ok(())`). Stage names:
+    /// "gate_vectors" | "router_weights" | "embeddings" | "down_meta".
+    pub stop_after: Option<String>,
+    /// Worker threads for the down_meta stage. `0` = one thread (serial code
+    /// path, unchanged behavior); `>1` splits each layer's feature space
+    /// across N `std::thread`s. Per-feature math and output ordering are
+    /// unchanged — the split is validated byte-identical against the serial
+    /// path on the gemma4 fixture.
+    pub down_threads: usize,
+}
+
+/// One completed stage's persistence record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageRecord {
+    /// Output file name relative to the vindex output dir.
+    pub output: String,
+    pub bytes: u64,
+    pub sha256: String,
+    /// down_meta only: number of layers fully processed when this checkpoint
+    /// was written (partial checkpoint — a later final write replaces it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_layers: Option<usize>,
+}
+
+/// Cross-session stage manifest (`stage-manifest.json`).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct StageManifest {
+    pub format: String,
+    pub model_name: String,
+    pub down_top_k: usize,
+    pub extract_level: crate::ExtractLevel,
+    pub dtype: StorageDtype,
+    pub vocab_size: usize,
+    pub stages: HashMap<String, StageRecord>,
+    /// Gate-stage product: per-layer feature inventory, required to assemble
+    /// index.json in the resuming session without re-reading the gate tensors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layer_infos: Vec<VindexLayerInfo>,
+}
+
+impl StageManifest {
+    const FORMAT: &'static str = "larql-stage-manifest/1";
+    fn load(path: &Path) -> Option<StageManifest> {
+        let text = std::fs::read_to_string(path).ok()?;
+        match serde_json::from_str::<StageManifest>(&text) {
+            Ok(m) if m.format == Self::FORMAT => Some(m),
+            Ok(m) => {
+                eprintln!(
+                    "  stage-manifest: ignoring {} (format {:?} != {:?})",
+                    path.display(),
+                    m.format,
+                    Self::FORMAT
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!("  stage-manifest: ignoring {} (parse: {e})", path.display());
+                None
+            }
+        }
+    }
+
+    fn stage_done(&self, name: &str) -> bool {
+        self.stages.contains_key(name)
+    }
+}
+
+/// Run-identity fields mirrored into the manifest so a resuming session can
+/// cross-check that it was handed the same run parameters.
+#[derive(Debug, Clone)]
+struct StageIdentity {
+    model_name: String,
+    down_top_k: usize,
+    extract_level: crate::ExtractLevel,
+    dtype: StorageDtype,
+}
+
+/// sha256 + byte size of a file (manifest integrity record for the
+/// persist→restore copy of each stage product).
+fn sha256_file(path: &Path) -> Result<(u64, String), VindexError> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 1 << 20];
+    let mut total = 0u64;
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((total, format!("{:x}", hasher.finalize())))
 }
 
 /// Build a vindex by streaming from safetensors files (no full model load).
@@ -253,11 +369,155 @@ pub fn build_vindex_streaming_opts(
 
     callbacks.on_stage_done("loading", 0.0);
 
+    // ── Stage-resume state (two-session split) ──
+    // Load the manifest from a previous session, if any. Completed stages are
+    // skipped; their tensor reads are pre-marked as consumed so consume-shards
+    // can still release shards whose remaining plan keys are all served.
+    let stage_control = &opts.stage_control;
+    let mut manifest = stage_control
+        .manifest_path
+        .as_ref()
+        .and_then(|p| StageManifest::load(p));
+    if let Some(m) = &manifest {
+        let done: Vec<&String> = m.stages.keys().collect();
+        eprintln!("  stage-resume: manifest loaded, completed stages: {done:?}");
+        if !m.layer_infos.is_empty() {
+            for key in gate_stage_keys(arch.as_ref(), num_layers, &prefixes) {
+                if let Some((shard_idx, name)) = tensor_index.get(&key) {
+                    consumed.record(*shard_idx, name);
+                }
+            }
+        }
+        if m.stage_done("router_weights") {
+            for key in router_stage_keys(arch.as_ref(), num_layers, &prefixes) {
+                if let Some((shard_idx, name)) = tensor_index.get(&key) {
+                    consumed.record(*shard_idx, name);
+                }
+            }
+        }
+        if m.stage_done("embeddings") {
+            let embed_key = normalize_key(arch.embed_key(), prefixes);
+            if let Some((shard_idx, name)) = tensor_index.get(&embed_key) {
+                consumed.record(*shard_idx, name);
+            }
+        }
+    }
+
+    // Persist one stage product into the manifest and rewrite the manifest file.
+    fn persist_stage(
+        manifest: &mut Option<StageManifest>,
+        manifest_path: Option<&Path>,
+        output_dir: &Path,
+        stage: &str,
+        file: &str,
+        layer_infos: Option<&[VindexLayerInfo]>,
+        vocab_size: Option<usize>,
+        done_layers: Option<usize>,
+        identity: &StageIdentity,
+    ) {
+        let Some(mp) = manifest_path else { return };
+        let m = manifest.get_or_insert_with(|| StageManifest {
+            format: StageManifest::FORMAT.to_string(),
+            model_name: identity.model_name.clone(),
+            down_top_k: identity.down_top_k,
+            extract_level: identity.extract_level,
+            dtype: identity.dtype,
+            vocab_size: 0,
+            stages: HashMap::new(),
+            layer_infos: Vec::new(),
+        });
+        if let Some(v) = vocab_size {
+            m.vocab_size = v;
+        }
+        if let Some(li) = layer_infos {
+            m.layer_infos = li.to_vec();
+        }
+        let fp = output_dir.join(file);
+        let recorded = match sha256_file(&fp) {
+            Ok((bytes, sha)) => {
+                m.stages.insert(
+                    stage.to_string(),
+                    StageRecord { output: file.to_string(), bytes, sha256: sha, done_layers },
+                );
+                true
+            }
+            Err(e) => {
+                eprintln!("  stage-resume: WARNING could not hash {}: {e}", fp.display());
+                false
+            }
+        };
+        if recorded {
+            match std::fs::File::create(mp).and_then(|f| {
+                serde_json::to_writer_pretty(f, &*m).map_err(|e| std::io::Error::new(
+                    std::io::ErrorKind::Other, e.to_string(),
+                ))
+            }) {
+                Ok(()) => eprintln!("  stage-resume: recorded stage {stage:?} -> {}", mp.display()),
+                Err(e) => eprintln!("  stage-resume: WARNING manifest write failed: {e}"),
+            }
+        }
+    }
+
+    // Clean stop: release open shards when asked, exit Ok.
+    macro_rules! stop_early {
+        () => {{
+            if opts.consume_shards {
+                for shard_idx in 0..shard_store.len() {
+                    if shard_store.slots[shard_idx].open.is_some() {
+                        shard_store.release_and_delete(shard_idx);
+                    }
+                }
+            }
+            return Ok(());
+        }};
+    }
+
     // ── 1. Gate vectors (streaming, one layer at a time) ──
+    let expert_format = arch.expert_format();
+    let identity = StageIdentity {
+        model_name: model_name.to_string(),
+        down_top_k,
+        extract_level,
+        dtype,
+    };
+    // A stop_after target that is ALREADY complete means this run would fall
+    // through the per-stage stop checks (skipped stages never complete here)
+    // and continue into later stages — stop now instead, with the same clean
+    // exit contract as a fresh stop.
+    if let Some(sa) = stage_control.stop_after.as_deref() {
+        if manifest.as_ref().is_some_and(|m| m.stage_done(sa)) {
+            eprintln!("  stage-resume: stop-after target {sa:?} already complete; stopping");
+            stop_early!();
+        }
+    }
+    let gate_done = manifest.as_ref().is_some_and(|m| m.stage_done("gate_vectors"));
+    let mut layer_infos: Vec<VindexLayerInfo> = Vec::new();
+    if gate_done {
+        layer_infos = manifest
+            .as_ref()
+            .map(|m| m.layer_infos.clone())
+            .unwrap_or_default();
+        if layer_infos.is_empty() {
+            return Err(VindexError::Parse(
+                "stage-manifest records gate_vectors complete but carries no layer_infos".to_string(),
+            ));
+        }
+        let gate_file = output_dir.join("gate_vectors.bin");
+        if !gate_file.exists() {
+            return Err(VindexError::Parse(format!(
+                "stage-resume: gate_vectors complete but {} is missing — restore it into the output dir before resuming",
+                gate_file.display()
+            )));
+        }
+        eprintln!(
+            "  stage-resume: gate_vectors complete ({} layer infos); skipping gate stage",
+            layer_infos.len()
+        );
+        callbacks.on_stage_done("gate_vectors", 0.0);
+    } else {
     callbacks.on_stage("gate_vectors");
     let gate_path = output_dir.join("gate_vectors.bin");
     let mut gate_file = BufWriter::new(std::fs::File::create(&gate_path)?);
-    let mut layer_infos: Vec<VindexLayerInfo> = Vec::new();
     let mut offset: u64 = 0;
 
     // Check expert format from the architecture
@@ -420,9 +680,24 @@ pub fn build_vindex_streaming_opts(
     }
     gate_file.flush()?;
     callbacks.on_stage_done("gate_vectors", 0.0);
+    persist_stage(
+        &mut manifest,
+        stage_control.manifest_path.as_deref(),
+        output_dir,
+        "gate_vectors",
+        "gate_vectors.bin",
+        Some(&layer_infos),
+        None,
+        None,
+        &identity,
+    );
+    if stage_control.stop_after.as_deref() == Some("gate_vectors") {
+        stop_early!();
+    }
+    } // end gate else (not resumed-complete)
 
     // ── 1b. Router weights (MoE models only) ──
-    if is_moe {
+    if is_moe && !manifest.as_ref().is_some_and(|m| m.stage_done("router_weights")) {
         callbacks.on_stage("router_weights");
         let router_path = output_dir.join("router_weights.bin");
         let mut router_file = BufWriter::new(std::fs::File::create(&router_path)?);
@@ -449,27 +724,135 @@ pub fn build_vindex_streaming_opts(
         }
         router_file.flush()?;
         callbacks.on_stage_done("router_weights", 0.0);
+        persist_stage(
+            &mut manifest,
+            stage_control.manifest_path.as_deref(),
+            output_dir,
+            "router_weights",
+            "router_weights.bin",
+            None,
+            None,
+            None,
+            &identity,
+        );
+        if stage_control.stop_after.as_deref() == Some("router_weights") {
+            stop_early!();
+        }
+    } else if is_moe {
+        // router_weights recorded complete in the manifest — output restored
+        // by the resuming session.
+        eprintln!("  stage-resume: router_weights complete; skipping router stage");
+        callbacks.on_stage_done("router_weights", 0.0);
     }
 
     // ── 2. Embeddings ──
+    let embed_done = manifest.as_ref().is_some_and(|m| m.stage_done("embeddings"));
+    let mut vocab_size = manifest.as_ref().map(|m| m.vocab_size).unwrap_or(0);
+    // The down_meta stage multiplies against the embedding matrix. When the
+    // embeddings stage is skipped (its product restored from the previous
+    // session), the embed tensor is re-read from the shard right before the
+    // down stage — same tensor, same decode, so down-stage logits are
+    // byte-identical to a single-session run.
+    let mut embed: Option<Array2<f32>> = None;
+    if embed_done {
+        if !output_dir.join("embeddings.bin").exists() {
+            return Err(VindexError::Parse(
+                "stage-resume: embeddings complete but embeddings.bin is missing — restore it into the output dir before resuming".to_string(),
+            ));
+        }
+        eprintln!(
+            "  stage-resume: embeddings complete; skipping embeddings stage (embed tensor re-read from shard for the down stage)"
+        );
+        callbacks.on_stage_done("embeddings", 0.0);
+    } else {
     callbacks.on_stage("embeddings");
     let embed_key = normalize_key(arch.embed_key(), prefixes);
-    let embed = get_tensor_f32(&shard_store, &tensor_index, &embed_key, &mut consumed)?
+    let e = get_tensor_f32(&shard_store, &tensor_index, &embed_key, &mut consumed)?
         .ok_or_else(|| VindexError::MissingTensor(embed_key.clone()))?;
-    let vocab_size = embed.shape()[0];
-    let embed_data = embed.as_slice().unwrap();
+    vocab_size = e.shape()[0];
+    let embed_data = e.as_slice().unwrap();
     let embed_bytes = crate::config::dtype::encode_floats(embed_data, dtype);
     std::fs::write(output_dir.join("embeddings.bin"), &embed_bytes)?;
+    embed = Some(e);
     callbacks.on_stage_done("embeddings", 0.0);
+    persist_stage(
+        &mut manifest,
+        stage_control.manifest_path.as_deref(),
+        output_dir,
+        "embeddings",
+        "embeddings.bin",
+        None,
+        Some(vocab_size),
+        None,
+        &identity,
+    );
+    if stage_control.stop_after.as_deref() == Some("embeddings") {
+        stop_early!();
+    }
+    }
 
-    // ── 3. Down meta (streaming) ──
+    // ── 3. Down meta (streaming; threaded + per-layer resumable) ──
+    let down_done_layers = manifest
+        .as_ref()
+        .and_then(|m| m.stages.get("down_meta"))
+        .and_then(|r| r.done_layers)
+        .unwrap_or(0);
+    let down_done =
+        manifest.as_ref().is_some_and(|m| m.stage_done("down_meta")) && down_done_layers >= num_layers;
+    if down_done {
+        if !output_dir.join("down_meta.bin").exists() {
+            return Err(VindexError::Parse(
+                "stage-resume: down_meta complete but down_meta.bin is missing — restore it into the output dir before resuming".to_string(),
+            ));
+        }
+        if vocab_size == 0 {
+            return Err(VindexError::Parse(
+                "stage-resume: down_meta complete but the manifest carries no vocab_size".to_string(),
+            ));
+        }
+        eprintln!("  stage-resume: down_meta complete ({num_layers}/{num_layers} layers); skipping down stage");
+        callbacks.on_stage_done("down_meta", 0.0);
+    } else {
     callbacks.on_stage("down_meta");
+    // The down stage multiplies against the embedding matrix. On resume the
+    // embeddings stage was skipped, so re-read the embed tensor from its
+    // shard (same tensor, same decode → identical logits).
+    let embed = match embed.take() {
+        Some(e) => e,
+        None => {
+            let embed_key = normalize_key(arch.embed_key(), prefixes);
+            get_tensor_f32(&shard_store, &tensor_index, &embed_key, &mut consumed)?
+                .ok_or_else(|| VindexError::MissingTensor(embed_key.clone()))?
+        }
+    };
+    vocab_size = embed.shape()[0];
     let mut all_down_meta: Vec<Option<Vec<Option<crate::FeatureMeta>>>> = vec![None; num_layers];
+
+    // Per-layer checkpoint resume: reload records for the layers an
+    // interrupted run already finished (same down_meta.bin format, partial
+    // file — not-yet-computed layers read back as None).
+    let mut start_layer = 0usize;
+    if down_done_layers > 0 && crate::format::down_meta::has_binary(output_dir) {
+        let (partial, _total, _tk) = crate::format::down_meta::read_binary_raw(output_dir, num_layers)?;
+        let keep = down_done_layers.min(num_layers).min(partial.len());
+        for (i, v) in partial.into_iter().take(keep).enumerate() {
+            all_down_meta[i] = v;
+        }
+        start_layer = keep;
+        eprintln!(
+            "  stage-resume: down_meta checkpoint holds {start_layer}/{num_layers} layer(s); resuming from layer {start_layer}"
+        );
+    }
 
     // Build whole-word vocab once
     let (_ww_ids, _ww_embed) = super::build::build_whole_word_vocab(tokenizer, &embed, vocab_size, hidden_size);
 
-    for (layer, layer_down_meta) in all_down_meta.iter_mut().enumerate().take(num_layers) {
+    let down_threads = stage_control.down_threads;
+    eprintln!(
+        "  down_meta: {num_layers} layer(s) to compute (from {start_layer}), threads={down_threads}, top_k={down_top_k}"
+    );
+    for layer in start_layer..num_layers {
+        let layer_down_meta = &mut all_down_meta[layer];
         callbacks.on_layer_start("down", layer, num_layers);
         let start = std::time::Instant::now();
 
@@ -574,6 +957,19 @@ pub fn build_vindex_streaming_opts(
             continue;
         }
 
+        if down_threads > 1 {
+            // Threaded path: expert-major feature blocks are distributed
+            // round-robin across workers; each block is computed with the
+            // SAME matmul shapes and per-feature math as the serial path, so
+            // the assembled layer records are byte-identical (validated on
+            // the gemma4 fixture). Per-batch on_feature_progress callbacks
+            // are not emitted on this path (SilentBuildCallbacks is the
+            // remote-run caller; layer start/done still fire).
+            let metas = compute_layer_down_meta_threaded(
+                &embed, &down_matrices, down_top_k, down_threads, tokenizer, layer,
+            );
+            *layer_down_meta = Some(metas);
+        } else {
         let mut feature_offset = 0usize;
         for w_down in &down_matrices {
             let num_features = w_down.shape()[1];
@@ -591,49 +987,54 @@ pub fn build_vindex_streaming_opts(
 
                 for feat in batch_start..batch_end {
                     let col = chunk_logits.column(feat - batch_start);
-                    let mut scores: Vec<(usize, f32)> = col.iter().copied().enumerate().collect();
-                    let k = down_top_k.min(scores.len());
-                    if k > 0 && k < scores.len() {
-                        scores.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
-                    }
-                    scores.truncate(k);
-                    scores.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-                    let top_k_entries: Vec<larql_models::TopKEntry> = scores.into_iter()
-                        .filter_map(|(idx, logit)| {
-                            tokenizer.decode(&[idx as u32], true).ok()
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty())
-                                .map(|token| larql_models::TopKEntry { token, token_id: idx as u32, logit })
-                        })
-                        .collect();
-
-                    let (top_token, top_token_id, c_score) = if let Some(first) = top_k_entries.first() {
-                        (first.token.clone(), first.token_id, first.logit)
-                    } else {
-                        (String::new(), 0, 0.0)
-                    };
-
+                    let meta = down_feature_meta(col, down_top_k, tokenizer);
                     let feat_idx = feature_offset + feat;
                     if layer_down_meta.is_none() {
                         *layer_down_meta = Some(Vec::new());
                     }
                     if let Some(ref mut metas) = layer_down_meta {
                         while metas.len() <= feat_idx { metas.push(None); }
-                        metas[feat_idx] = Some(crate::FeatureMeta {
-                            top_token, top_token_id, c_score, top_k: top_k_entries,
-                        });
+                        metas[feat_idx] = Some(meta);
                     }
                 }
             }
             feature_offset += num_features;
         }
+        } // end serial else
 
         callbacks.on_layer_done("down", layer, start.elapsed().as_secs_f64() * 1000.0);
+
+        // Per-layer checkpoint (manifest mode only): rewrite down_meta.bin in
+        // the unchanged binary format (uncomputed layers are None records)
+        // and record the layer watermark, so an interrupted session resumes
+        // from the next layer instead of restarting the whole stage.
+        if stage_control.manifest_path.is_some() {
+            crate::format::down_meta::write_binary(output_dir, &all_down_meta, down_top_k)?;
+            record_down_checkpoint(
+                &mut manifest,
+                stage_control.manifest_path.as_deref(),
+                layer + 1,
+            );
+        }
     }
 
     crate::format::down_meta::write_binary(output_dir, &all_down_meta, down_top_k)?;
     callbacks.on_stage_done("down_meta", 0.0);
+    persist_stage(
+        &mut manifest,
+        stage_control.manifest_path.as_deref(),
+        output_dir,
+        "down_meta",
+        "down_meta.bin",
+        None,
+        Some(vocab_size),
+        Some(num_layers),
+        &identity,
+    );
+    if stage_control.stop_after.as_deref() == Some("down_meta") {
+        stop_early!();
+    }
+    } // end down else (not resumed-complete)
 
     // ── consume-shards (browse level): the full browse consumption plan has
     // been served by now, so every shard whose planned tensors are all
@@ -1011,4 +1412,221 @@ fn write_floats(w: &mut impl Write, data: &[f32], dtype: StorageDtype) -> Result
     let bytes = crate::config::dtype::encode_floats(data, dtype);
     w.write_all(&bytes)?;
     Ok(bytes.len() as u64)
+}
+
+/// Update the down_meta layer watermark in the manifest WITHOUT re-hashing the
+/// checkpoint (intermediate per-layer checkpoints are same-machine temp state;
+/// the final stage record carries the sha256).
+fn record_down_checkpoint(
+    manifest: &mut Option<StageManifest>,
+    manifest_path: Option<&Path>,
+    done_layers: usize,
+) {
+    let Some(mp) = manifest_path else { return };
+    let Some(m) = manifest.as_mut() else { return };
+    let entry = m.stages.entry("down_meta".to_string()).or_insert_with(|| StageRecord {
+        output: "down_meta.bin".to_string(),
+        bytes: 0,
+        sha256: String::new(),
+        done_layers: None,
+    });
+    entry.done_layers = Some(done_layers);
+    let write = std::fs::File::create(mp).and_then(|f| {
+        serde_json::to_writer_pretty(f, &*m).map_err(|e| std::io::Error::new(
+            std::io::ErrorKind::Other, e.to_string(),
+        ))
+    });
+    if let Err(e) = write {
+        eprintln!("  stage-resume: WARNING manifest write failed: {e}");
+    }
+}
+
+/// Per-feature down_meta record — the EXACT math of the serial path
+/// (select_nth partial top-k → truncate → sort → tokenizer decode filter),
+/// factored out so the threaded path computes byte-identical records.
+fn down_feature_meta(
+    logits_col: ndarray::ArrayView1<f32>,
+    down_top_k: usize,
+    tokenizer: &tokenizers::Tokenizer,
+) -> crate::FeatureMeta {
+    let mut scores: Vec<(usize, f32)> = logits_col.iter().copied().enumerate().collect();
+    let k = down_top_k.min(scores.len());
+    if k > 0 && k < scores.len() {
+        scores.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
+    }
+    scores.truncate(k);
+    scores.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    let top_k_entries: Vec<larql_models::TopKEntry> = scores
+        .into_iter()
+        .filter_map(|(idx, logit)| {
+            tokenizer
+                .decode(&[idx as u32], true)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(|token| larql_models::TopKEntry { token, token_id: idx as u32, logit })
+        })
+        .collect();
+
+    let (top_token, top_token_id, c_score) = if let Some(first) = top_k_entries.first() {
+        (first.token.clone(), first.token_id, first.logit)
+    } else {
+        (String::new(), 0, 0.0)
+    };
+
+    crate::FeatureMeta { top_token, top_token_id, c_score, top_k: top_k_entries }
+}
+
+/// Threaded down_meta for one layer: the layer's expert-major feature blocks
+/// (one block per down matrix, contiguous global feature ids) are distributed
+/// round-robin across workers. Each block is computed with the SAME matmul
+/// shapes (batch 1024 within a matrix, identical to the serial path) and the
+/// same per-feature math, so output is byte-identical to the serial path —
+/// only the wall-clock distribution changes.
+///
+/// Progress: each worker throttles its own rate line to ≤1 per 30 s; the
+/// per-batch `on_feature_progress` callback is not used on this path.
+fn compute_layer_down_meta_threaded(
+    embed: &Array2<f32>,
+    down_matrices: &[Array2<f32>],
+    down_top_k: usize,
+    n_threads: usize,
+    tokenizer: &tokenizers::Tokenizer,
+    layer: usize,
+) -> Vec<Option<crate::FeatureMeta>> {
+    use larql_compute::ComputeBackend;
+
+    // Contiguous global feature offset of each matrix (expert-major order,
+    // matching the serial feature_offset accumulation).
+    let mut offsets = Vec::with_capacity(down_matrices.len());
+    let mut total = 0usize;
+    for m in down_matrices {
+        offsets.push(total);
+        total += m.shape()[1];
+    }
+
+    let n_threads = n_threads.max(1).min(down_matrices.len().max(1));
+    let batch_size = 1024usize;
+    let cpu = &larql_compute::CpuBackend;
+    let offsets = &offsets;
+    let started = std::time::Instant::now();
+
+    let results: Vec<Vec<Option<crate::FeatureMeta>>> = std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for t in 0..n_threads {
+            // Round-robin whole-matrix assignment keeps every matmul at the
+            // serial path's exact shape ([vocab, mat_features] per batch).
+            let mats: Vec<usize> = (t..down_matrices.len()).step_by(n_threads).collect();
+            handles.push(s.spawn(move || {
+                let mut out: Vec<Option<crate::FeatureMeta>> = Vec::new();
+                let mut last_log = std::time::Instant::now();
+                let mut done = 0usize;
+                for mi in mats {
+                    let w_down = &down_matrices[mi];
+                    let num_features = w_down.shape()[1];
+                    for batch_start in (0..num_features).step_by(batch_size) {
+                        let batch_end = (batch_start + batch_size).min(num_features);
+                        let w_chunk =
+                            w_down.slice(ndarray::s![.., batch_start..batch_end]).to_owned();
+                        let chunk_logits = cpu.matmul(embed.view(), w_chunk.view());
+                        for feat in batch_start..batch_end {
+                            let col = chunk_logits.column(feat - batch_start);
+                            let meta = down_feature_meta(col, down_top_k, tokenizer);
+                            out.push(Some(meta));
+                        }
+                        done += batch_end - batch_start;
+                        if last_log.elapsed().as_secs() >= 30 {
+                            let rate = done as f64 / last_log.elapsed().as_secs_f64();
+                            eprintln!(
+                                "  down_meta: layer {layer} thread {t}: mat {mi} batch {batch_start}..{batch_end} done, {rate:.0} feat/s"
+                            );
+                            last_log = std::time::Instant::now();
+                            done = 0;
+                        }
+                    }
+                }
+                out
+            }));
+        }
+        handles.into_iter().map(|h| h.join().expect("down_meta worker panicked")).collect()
+    });
+
+    // Reassemble global order: thread t owns mats {t, t+n, ...}; each worker's
+    // output list is in its own mat order, so place each run of records at its
+    // matrices' global offsets.
+    let mut metas: Vec<Option<crate::FeatureMeta>> = (0..total).map(|_| None).collect();
+    for (t, worker_out) in results.into_iter().enumerate() {
+        let mut cursor = 0usize;
+        for mi in (t..down_matrices.len()).step_by(n_threads) {
+            let nf = down_matrices[mi].shape()[1];
+            let base = offsets[mi];
+            for i in 0..nf {
+                metas[base + i] = worker_out[cursor + i].clone();
+            }
+            cursor += nf;
+        }
+        debug_assert_eq!(cursor, worker_out.len());
+    }
+    eprintln!(
+        "  down_meta: layer {layer} complete: {total} features in {:.1}s ({:.0} feat/s, {n_threads} threads)",
+        started.elapsed().as_secs_f64(),
+        total as f64 / started.elapsed().as_secs_f64().max(1e-9),
+    );
+    metas
+}
+
+/// The exact tensor keys the GATE stage reads — pre-marked consumed on
+/// stage-resume so consume-shards can still release shards that hold only
+/// gate tensors.
+fn gate_stage_keys(
+    arch: &dyn larql_models::ModelArchitecture,
+    num_layers: usize,
+    prefixes: &[&str],
+) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for layer in 0..num_layers {
+        match arch.expert_format() {
+            larql_models::ExpertFormat::PackedBf16 => {
+                if let Some(k) = arch.packed_experts_gate_up_key(layer) {
+                    keys.push(k);
+                }
+            }
+            larql_models::ExpertFormat::PackedMxfp4 => {
+                for k in [arch.packed_gate_up_blocks_key(layer), arch.packed_gate_up_scales_key(layer)]
+                    .into_iter()
+                    .flatten()
+                {
+                    keys.push(k);
+                }
+            }
+            _ if arch.is_moe() && arch.num_experts() > 0 => {
+                for expert in 0..arch.num_experts() {
+                    if let Some(k) = arch.expert_ffn_gate_key(layer, expert) {
+                        keys.push(k);
+                    }
+                }
+            }
+            _ => keys.push(arch.ffn_gate_key(layer)),
+        }
+    }
+    keys.iter().map(|k| normalize_key(k, prefixes)).collect()
+}
+
+/// The exact tensor keys the ROUTER stage reads (router weights + probed bias).
+fn router_stage_keys(
+    arch: &dyn larql_models::ModelArchitecture,
+    num_layers: usize,
+    prefixes: &[&str],
+) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    if arch.is_moe() {
+        for layer in 0..num_layers {
+            if let Some(router_key) = arch.moe_router_key(layer) {
+                keys.push(router_key.clone());
+                keys.push(router_key.replace(".weight", ".bias"));
+            }
+        }
+    }
+    keys.iter().map(|k| normalize_key(k, prefixes)).collect()
 }

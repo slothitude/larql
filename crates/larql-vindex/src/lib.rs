@@ -47,7 +47,8 @@ pub use describe::{DescribeEdge, LabelSource};
 // Extract
 pub use extract::{
     build_vindex, build_vindex_resume, build_vindex_from_vectors,
-    build_vindex_streaming, build_vindex_streaming_opts, StreamingOpts,
+    build_vindex_streaming, build_vindex_streaming_opts, StageControl, StageManifest, StageRecord,
+    StreamingOpts,
     IndexBuildCallbacks, SilentBuildCallbacks,
 };
 

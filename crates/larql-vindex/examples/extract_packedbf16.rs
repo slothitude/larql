@@ -1,15 +1,23 @@
 //! Remote-run extraction entry point for PackedBf16 checkpoints (Gemma 4 26B-A4B).
 //!
 //! Thin CLI wrapper over `build_vindex_streaming_opts` — same pipeline as
-//! `larql extract-index`, plus `--consume-shards` for tight-disk hosts: each
-//! safetensors shard is DELETED once extraction has consumed every tensor it
-//! needs from it (only the exact shard files are removed; config.json,
-//! tokenizer.json and every other file survive).
+//! `larql extract-index`, plus:
+//! - `--consume-shards` for tight-disk hosts: each safetensors shard is
+//!   DELETED once extraction has consumed every tensor it needs from it
+//!   (only the exact shard files are removed; config.json, tokenizer.json and
+//!   every other file survive).
+//! - Two-session split (M2 step-8): `--stage-manifest <path>` + `--stop-after
+//!   <stage>` run a stage prefix and persist its products + the manifest;
+//!   re-running with the same `--stage-manifest` skips completed stages.
+//!   `--down-threads N` splits the down_meta stage across N worker threads
+//!   (byte-identical output, ~N× wall clock on the down stage).
 //!
 //! Usage:
 //!   cargo run --release -p larql-vindex --example extract_packedbf16 -- \
 //!       <model_dir> -o <output.vindex> [--f16] [--down-top-k 10] \
-//!       [--level browse|inference|all] [--consume-shards] [--model <display name>]
+//!       [--level browse|inference|all] [--consume-shards] [--model <display name>] \
+//!       [--stage-manifest <path>] [--stop-after gate_vectors|router_weights|embeddings|down_meta] \
+//!       [--down-threads N]
 //!
 //! No model downloads happen here — point it at an already-downloaded snapshot.
 
@@ -24,6 +32,7 @@ fn main() {
     let mut level = larql_vindex::ExtractLevel::Browse;
     let mut dtype = larql_vindex::StorageDtype::F32;
     let mut consume_shards = false;
+    let mut stage_control = larql_vindex::StageControl::default();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -49,6 +58,21 @@ fn main() {
             }
             "--f16" => dtype = larql_vindex::StorageDtype::F16,
             "--consume-shards" => consume_shards = true,
+            "--stage-manifest" => {
+                stage_control.manifest_path =
+                    Some(PathBuf::from(args.next().expect("--stage-manifest needs a value")));
+            }
+            "--stop-after" => {
+                stage_control.stop_after =
+                    Some(args.next().expect("--stop-after needs a value"));
+            }
+            "--down-threads" => {
+                stage_control.down_threads = args
+                    .next()
+                    .expect("--down-threads needs a value")
+                    .parse()
+                    .expect("--down-threads needs a number");
+            }
             other => {
                 if other.starts_with('-') {
                     eprintln!("unknown flag: {other}");
@@ -72,19 +96,29 @@ fn main() {
     let tokenizer = larql_vindex::tokenizers::Tokenizer::from_file(&tok_path)
         .unwrap_or_else(|e| panic!("failed to load {}: {e}", tok_path.display()));
 
-    let opts = larql_vindex::StreamingOpts { consume_shards };
+    let opts = larql_vindex::StreamingOpts { consume_shards, stage_control };
     let start = std::time::Instant::now();
-    larql_vindex::build_vindex_streaming_opts(
-        &model_dir,
-        &tokenizer,
-        &model_name,
-        &output,
-        down_top_k,
-        level,
-        dtype,
-        &mut larql_vindex::SilentBuildCallbacks,
-        &opts,
-    )
-    .unwrap_or_else(|e| panic!("extraction failed: {e}"));
-    eprintln!("done in {:.1}s → {}", start.elapsed().as_secs_f64(), output.display());
+    // Run on a big-stack worker: BLAS static-init and the extraction's deep
+    // call paths overflow the 1 MB MSVC main thread on Windows (Linux's 8 MB
+    // main thread and cargo-test's 8 MB worker threads never hit this).
+    let output_path = output.clone();
+    let worker = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            larql_vindex::build_vindex_streaming_opts(
+                &model_dir,
+                &tokenizer,
+                &model_name,
+                &output,
+                down_top_k,
+                level,
+                dtype,
+                &mut larql_vindex::SilentBuildCallbacks,
+                &opts,
+            )
+            .unwrap_or_else(|e| panic!("extraction failed: {e}"));
+        })
+        .expect("spawn extraction worker");
+    worker.join().expect("extraction worker panicked");
+    eprintln!("done in {:.1}s → {}", start.elapsed().as_secs_f64(), output_path.display());
 }
